@@ -1,0 +1,4 @@
+/psproxy-server
+*.exe
+*.dll
+*.pdb
