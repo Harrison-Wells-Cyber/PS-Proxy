@@ -14,7 +14,7 @@ type Session struct {
 	ID             string
 	Server         string
 	Port           int
-	CertPin        string
+	ServerKey      string
 	EnrollToken    string
 	ReconnectToken string
 	DNSTarget      string
@@ -43,7 +43,7 @@ func NewSecret(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-func (s *Store) Create(server string, port int, certPin, dnsTarget string) (*Session, error) {
+func (s *Store) Create(server string, port int, serverKey, dnsTarget string) (*Session, error) {
 	id, err := NewSecret(18)
 	if err != nil {
 		return nil, err
@@ -56,7 +56,7 @@ func (s *Store) Create(server string, port int, certPin, dnsTarget string) (*Ses
 	if err != nil {
 		return nil, err
 	}
-	sess := &Session{ID: id, Server: server, Port: port, CertPin: certPin, EnrollToken: tok, ReconnectToken: reconnect, DNSTarget: dnsTarget, ExpiresAt: time.Now().Add(s.ttl)}
+	sess := &Session{ID: id, Server: server, Port: port, ServerKey: serverKey, EnrollToken: tok, ReconnectToken: reconnect, DNSTarget: dnsTarget, ExpiresAt: time.Now().Add(s.ttl)}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions[id] = sess
@@ -113,7 +113,7 @@ type AgentTemplateData struct {
 	AssemblyB64    string
 	Server         string
 	Port           int
-	CertPin        string
+	ServerKey      string
 	EnrollToken    string
 	ReconnectToken string
 	DNSTarget      string
@@ -129,6 +129,6 @@ func AgentHandler(store *Store, tmpl *template.Template, assemblyB64 string) htt
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
-		_ = tmpl.Execute(w, AgentTemplateData{AssemblyB64: assemblyB64, Server: sess.Server, Port: sess.Port, CertPin: sess.CertPin, EnrollToken: sess.EnrollToken, ReconnectToken: sess.ReconnectToken, DNSTarget: sess.DNSTarget})
+		_ = tmpl.Execute(w, AgentTemplateData{AssemblyB64: assemblyB64, Server: sess.Server, Port: sess.Port, ServerKey: sess.ServerKey, EnrollToken: sess.EnrollToken, ReconnectToken: sess.ReconnectToken, DNSTarget: sess.DNSTarget})
 	}
 }

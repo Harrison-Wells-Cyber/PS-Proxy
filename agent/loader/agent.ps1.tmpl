@@ -2,7 +2,7 @@
 param(
     [string]$Server = "{{.Server}}",
     [int]$Port = {{.Port}},
-    [string]$CertPin = "{{.CertPin}}",
+    [string]$ServerKey = "{{.ServerKey}}",
     [string]$EnrollToken = "{{.EnrollToken}}",
     [string]$ReconnectToken = "{{.ReconnectToken}}",
     [string]$DNSTarget = "{{.DNSTarget}}",
@@ -30,13 +30,13 @@ function Start-PSTunnel {
     param(
         [Parameter(Mandatory=$true)][string]$Server,
         [int]$Port = 443,
-        [Parameter(Mandatory=$true)][string]$CertPin,
+        [Parameter(Mandatory=$true)][string]$ServerKey,
         [Parameter(Mandatory=$true)][string]$EnrollToken,
         [string]$ReconnectToken = "",
         [string]$DNSTarget = ""
     )
     if (-not ("PSProxy.Agent.Tunnel" -as [type])) { Import-PSProxyAgentAssembly }
-    $t = New-Object PSProxy.Agent.Tunnel -ArgumentList @($Server, $Port, $CertPin, $EnrollToken, $ReconnectToken, $DNSTarget)
+    $t = New-Object PSProxy.Agent.Tunnel -ArgumentList @($Server, $Port, $ServerKey, $EnrollToken, $ReconnectToken, $DNSTarget)
     $t.Run()
 }
-if (-not $NoAutoStart) { Start-PSTunnel -Server $Server -Port $Port -CertPin $CertPin -EnrollToken $EnrollToken -ReconnectToken $ReconnectToken -DNSTarget $DNSTarget }
+if (-not $NoAutoStart) { Start-PSTunnel -Server $Server -Port $Port -ServerKey $ServerKey -EnrollToken $EnrollToken -ReconnectToken $ReconnectToken -DNSTarget $DNSTarget }

@@ -2,8 +2,13 @@ package main
 
 import (
 	"bufio"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -34,7 +39,7 @@ func main() {
 	port := flag.Int("port", 443, "TLS listener port")
 	cert := flag.String("cert", "", "TLS fullchain PEM; defaults to /etc/letsencrypt/live/<domain>/fullchain.pem")
 	key := flag.String("key", "", "TLS private key PEM; defaults to /etc/letsencrypt/live/<domain>/privkey.pem")
-	agentCertPinOverride := flag.String("agent-cert-pin-override", "", "override SHA-256 DER certificate pin embedded in staged agents; use only when an authorized TLS inspection device presents a different leaf cert")
+	identityKeyPath := flag.String("identity-key", "psproxy_identity.pem", "stable RSA identity private key PEM for PS-Proxy application-layer tunnel trust")
 	tun := flag.String("tun", "psproxy0", "TUN interface name for the planned netstack data plane")
 	agentTemplate := flag.String("agent-template", "agent/loader/agent.ps1.tmpl", "PowerShell agent loader template")
 	agentAssemblyFile := flag.String("agent-assembly-b64-file", "", "file containing compressed/base64 PSProxy.Agent.dll; defaults to release/agent_assembly.b64 when present")
@@ -71,16 +76,13 @@ func main() {
 	if err := validateRoutes(routes); err != nil {
 		log.Fatal(err)
 	}
-	pin, err := certPin(*cert)
+	identityKey, err := loadOrCreateIdentityKey(*identityKeyPath)
 	if err != nil {
-		log.Fatalf("certificate pin failed: %v", err)
+		log.Fatalf("identity key load failed: %v", err)
 	}
-	if *agentCertPinOverride != "" {
-		pin, err = normalizeCertPin(*agentCertPinOverride)
-		if err != nil {
-			log.Fatalf("invalid --agent-cert-pin-override: %v", err)
-		}
-		log.Printf("WARNING: using operator-supplied agent certificate pin override")
+	serverKey, identityPin, err := publicKeyStaging(identityKey)
+	if err != nil {
+		log.Fatalf("identity public key encode failed: %v", err)
 	}
 	assembly, err := loadAssemblyB64(*agentAssemblyFile)
 	if err != nil {
@@ -91,11 +93,12 @@ func main() {
 	}
 	tmpl := template.Must(template.ParseFiles(*agentTemplate))
 	store := staging.NewStore(*ttl)
-	sess, err := store.Create(*domain, *port, pin, *dnsTarget)
+	sess, err := store.Create(*domain, *port, serverKey, *dnsTarget)
 	if err != nil {
 		log.Fatal(err)
 	}
 	server := NewTunnelServer(store, *maxStreams)
+	server.identityKey = identityKey
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /a/{id}", staging.AgentHandler(store, tmpl, assembly))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) })
@@ -116,7 +119,8 @@ func main() {
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
 	log.Printf("PS-Proxy Go server starting on https://%s", addr)
 	log.Printf("TLS certificate: %s", *cert)
-	log.Printf("Agent cert pin: %s", pin)
+	log.Printf("PS-Proxy identity key: %s", *identityKeyPath)
+	log.Printf("PS-Proxy identity public key pin: %s", identityPin)
 	log.Printf("Planned TUN target: %s routes=%s", *tun, strings.Join(routes, ","))
 	if *redirect {
 		log.Printf("Transparent redirect mode enabled on 127.0.0.1:%d", *redirectPort)
@@ -132,12 +136,13 @@ func main() {
 }
 
 type TunnelServer struct {
-	store      *staging.Store
-	mu         sync.Mutex
-	session    *AgentSession
-	nextID     atomic.Uint64
-	dnsID      atomic.Uint64
-	maxStreams int
+	store       *staging.Store
+	identityKey *rsa.PrivateKey
+	mu          sync.Mutex
+	session     *AgentSession
+	nextID      atomic.Uint64
+	dnsID       atomic.Uint64
+	maxStreams  int
 }
 
 func NewTunnelServer(store *staging.Store, maxStreams int) *TunnelServer {
@@ -194,13 +199,14 @@ type AgentSession struct {
 	dnsPending map[uint64]chan []byte
 	locals     map[uint64]*localStream
 	maxStreams int
+	codec      protocol.Codec
 }
 
 func NewAgentSession(c net.Conn, br *bufio.Reader, maxStreams int) *AgentSession {
 	if maxStreams < 1 {
 		maxStreams = 1
 	}
-	return &AgentSession{conn: c, br: br, closed: make(chan struct{}), pending: map[uint64]chan error{}, dnsPending: map[uint64]chan []byte{}, locals: map[uint64]*localStream{}, maxStreams: maxStreams}
+	return &AgentSession{conn: c, br: br, codec: protocol.NewPlainCodec(br, c), closed: make(chan struct{}), pending: map[uint64]chan error{}, dnsPending: map[uint64]chan []byte{}, locals: map[uint64]*localStream{}, maxStreams: maxStreams}
 }
 
 func (a *AgentSession) Close() {
@@ -227,7 +233,7 @@ func (a *AgentSession) Close() {
 func (a *AgentSession) send(f protocol.Frame) error {
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
-	return protocol.WriteFrame(a.conn, f)
+	return a.codec.WriteFrame(f)
 }
 
 func (a *AgentSession) Open(id uint64, target string) error {
@@ -280,7 +286,7 @@ func (a *AgentSession) RemoveLocal(id uint64) {
 func (a *AgentSession) Run() {
 	defer a.Close()
 	for {
-		f, err := protocol.ReadFrame(a.br)
+		f, err := a.codec.ReadFrame()
 		if err != nil {
 			log.Printf("agent disconnected: %v", err)
 			return
@@ -648,26 +654,30 @@ func handleTLSConn(raw net.Conn, cfg *tls.Config, mux *http.ServeMux, server *Tu
 }
 
 func handleAgent(conn net.Conn, br *bufio.Reader, server *TunnelServer) {
-	line, err := br.ReadString('\n')
-	if err != nil {
+	codec := protocol.Codec(protocol.NewPlainCodec(br, conn))
+	if server.identityKey != nil {
+		secure, err := serverHandshake(conn, br, server.identityKey)
+		if err != nil {
+			log.Printf("agent secure handshake failed: %v", err)
+			_ = conn.Close()
+			return
+		}
+		codec = secure
+	}
+	f, err := codec.ReadFrame()
+	if err != nil || f.Type != protocol.FramePing {
 		_ = conn.Close()
 		return
 	}
-	line = strings.TrimSpace(line)
-	const prefix = "ENROLL "
-	if !strings.HasPrefix(line, prefix) {
+	fields := strings.Fields(string(f.Payload))
+	if len(fields) == 0 || fields[0] != "ENROLL" || len(fields) < 2 {
 		_ = conn.Close()
 		return
 	}
-	fields := strings.Fields(strings.TrimPrefix(line, prefix))
-	if len(fields) == 0 {
-		_ = conn.Close()
-		return
-	}
-	enrollToken := fields[0]
+	enrollToken := fields[1]
 	reconnectToken := ""
-	if len(fields) > 1 {
-		reconnectToken = fields[1]
+	if len(fields) > 2 {
+		reconnectToken = fields[2]
 	}
 	if err := server.store.Authenticate(enrollToken, reconnectToken); err != nil {
 		log.Printf("agent enrollment failed: %v", err)
@@ -675,11 +685,61 @@ func handleAgent(conn net.Conn, br *bufio.Reader, server *TunnelServer) {
 		return
 	}
 	a := NewAgentSession(conn, br, server.maxStreams)
+	a.codec = codec
 	server.SetSession(a)
 	log.Printf("agent enrolled and connected from %s", conn.RemoteAddr())
 	_ = a.send(protocol.Frame{Type: protocol.FramePong, Payload: []byte("OK")})
 	a.Run()
 	server.ClearSession(a)
+}
+
+func serverHandshake(conn net.Conn, br *bufio.Reader, key *rsa.PrivateKey) (*protocol.SecureCodec, error) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Fields(strings.TrimSpace(line))
+	if len(parts) != 3 || parts[0] != "HELLO" {
+		return nil, errors.New("expected HELLO")
+	}
+	encSecret, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, err
+	}
+	clientNonce, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, err
+	}
+	if len(clientNonce) != 32 {
+		return nil, errors.New("invalid client nonce")
+	}
+	secret, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, key, encSecret, []byte("PS-Proxy PSP1 session"))
+	if err != nil {
+		return nil, err
+	}
+	if len(secret) != 32 {
+		return nil, errors.New("invalid session secret")
+	}
+	serverNonce := make([]byte, 32)
+	if _, err := rand.Read(serverNonce); err != nil {
+		return nil, err
+	}
+	pubDER, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		return nil, err
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(protocol.Magic))
+	mac.Write([]byte(line))
+	mac.Write(serverNonce)
+	mac.Write(clientNonce)
+	mac.Write(pubDER)
+	proof := mac.Sum(nil)
+	resp := "PROOF " + base64.RawURLEncoding.EncodeToString(serverNonce) + " " + base64.RawURLEncoding.EncodeToString(proof) + "\n"
+	if _, err := io.WriteString(conn, resp); err != nil {
+		return nil, err
+	}
+	return protocol.NewSecureCodec(br, conn, secret)
 }
 
 type singleListener struct {
@@ -716,28 +776,45 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
-func normalizeCertPin(pin string) (string, error) {
-	normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(pin), ":", ""), " ", ""))
-	if len(normalized) != 64 {
-		return "", fmt.Errorf("pin must be 64 hex characters after removing colons/spaces")
+func loadOrCreateIdentityKey(path string) (*rsa.PrivateKey, error) {
+	if b, err := os.ReadFile(path); err == nil {
+		block, _ := pem.Decode(b)
+		if block == nil {
+			return nil, fmt.Errorf("no PEM block in %s", path)
+		}
+		if k, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+			return k, nil
+		}
+		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		k, ok := parsed.(*rsa.PrivateKey)
+		if !ok {
+			return nil, errors.New("identity key is not RSA")
+		}
+		return k, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
-	if _, err := hex.DecodeString(normalized); err != nil {
-		return "", fmt.Errorf("pin must be hex: %w", err)
+	k, err := rsa.GenerateKey(rand.Reader, 3072)
+	if err != nil {
+		return nil, err
 	}
-	return normalized, nil
+	b := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		return nil, err
+	}
+	return k, nil
 }
 
-func certPin(path string) (string, error) {
-	pemBytes, err := os.ReadFile(path)
+func publicKeyStaging(k *rsa.PrivateKey) (string, string, error) {
+	der, err := x509.MarshalPKIXPublicKey(&k.PublicKey)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	block, _ := pem.Decode(pemBytes)
-	if block == nil || block.Type != "CERTIFICATE" {
-		return "", fmt.Errorf("no PEM certificate found in %s", path)
-	}
-	sum := sha256.Sum256(block.Bytes)
-	return hex.EncodeToString(sum[:]), nil
+	sum := sha256.Sum256(der)
+	return base64.StdEncoding.EncodeToString(der), hex.EncodeToString(sum[:]), nil
 }
 func publicURL(domain string, port int) string {
 	if port == 443 {
