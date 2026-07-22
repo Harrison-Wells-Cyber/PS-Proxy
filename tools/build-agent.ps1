@@ -23,6 +23,8 @@ $template = $template.Replace('{{.Server}}', '__SERVER__')
 $template = $template.Replace('{{.Port}}', '443')
 $template = $template.Replace('{{.CertPin}}', '__CERT_PIN__')
 $template = $template.Replace('{{.EnrollToken}}', '__ENROLL_TOKEN__')
+$template = $template.Replace('{{.ReconnectToken}}', '__RECONNECT_TOKEN__')
+$template = $template.Replace('{{.DNSTarget}}', '__DNS_TARGET__')
 [IO.File]::WriteAllText($OutFile, $template, [Text.Encoding]::UTF8)
 Write-Host "Wrote $OutFile"
 Write-Host "Wrote $b64Out"

