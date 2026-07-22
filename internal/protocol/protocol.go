@@ -16,6 +16,8 @@ const (
 	FrameClose    byte = 5
 	FramePing     byte = 6
 	FramePong     byte = 7
+	FrameDNSQuery byte = 8
+	FrameDNSReply byte = 9
 
 	MaxPayload = 1 << 20
 )
