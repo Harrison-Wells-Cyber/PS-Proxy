@@ -160,6 +160,25 @@ connections during high-concurrency tools such as NetExec; the default is 256. W
   but host telemetry, PowerShell logging, AMSI, EDR, crash dumps, or pagefile
   behavior are outside the loader's control.
 
+
+### TLS inspection / enterprise decryption
+
+If an authorized enterprise TLS inspection device presents a different leaf
+certificate to the Windows agent than the certificate loaded by the VPS server,
+agent certificate pinning will fail. The safest fix is to exempt the PS-Proxy
+server domain from TLS decryption so the agent sees the VPS certificate directly.
+
+For controlled labs where decryption cannot be bypassed, pass the inspected leaf
+certificate SHA-256 DER hash explicitly:
+
+```bash
+--agent-cert-pin-override <64-char-sha256-hex-pin>
+```
+
+Only use this when you control and trust the inspection device. This pins the
+agent to the certificate it actually sees, not the certificate file loaded by the
+VPS server.
+
 ## Current implementation status
 
 Implemented now:

@@ -124,3 +124,23 @@ func TestSingleListenerAcceptReturnsEOFAfterFirstConn(t *testing.T) {
 		t.Fatal("second accept should return EOF")
 	}
 }
+
+func TestNormalizeCertPin(t *testing.T) {
+	pin := "BC:1D:96:47:91:A5:11:B4:95:26:EC:F2:25:35:37:F6:E6:17:0A:1A:19:4F:45:65:9E:88:0C:A7:A4:3D:6C:02"
+	got, err := normalizeCertPin(pin)
+	if err != nil {
+		t.Fatalf("normalize pin failed: %v", err)
+	}
+	want := "bc1d964791a511b49526ecf2253537f6e6170a1a194f45659e880ca7a43d6c02"
+	if got != want {
+		t.Fatalf("unexpected normalized pin: %s", got)
+	}
+}
+
+func TestNormalizeCertPinRejectsInvalidPins(t *testing.T) {
+	for _, pin := range []string{"abc", "zz1d964791a511b49526ecf2253537f6e6170a1a194f45659e880ca7a43d6c02"} {
+		if _, err := normalizeCertPin(pin); err == nil {
+			t.Fatalf("expected invalid pin %q to fail", pin)
+		}
+	}
+}

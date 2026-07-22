@@ -34,6 +34,7 @@ func main() {
 	port := flag.Int("port", 443, "TLS listener port")
 	cert := flag.String("cert", "", "TLS fullchain PEM; defaults to /etc/letsencrypt/live/<domain>/fullchain.pem")
 	key := flag.String("key", "", "TLS private key PEM; defaults to /etc/letsencrypt/live/<domain>/privkey.pem")
+	agentCertPinOverride := flag.String("agent-cert-pin-override", "", "override SHA-256 DER certificate pin embedded in staged agents; use only when an authorized TLS inspection device presents a different leaf cert")
 	tun := flag.String("tun", "psproxy0", "TUN interface name for the planned netstack data plane")
 	agentTemplate := flag.String("agent-template", "agent/loader/agent.ps1.tmpl", "PowerShell agent loader template")
 	agentAssemblyFile := flag.String("agent-assembly-b64-file", "", "file containing compressed/base64 PSProxy.Agent.dll; defaults to release/agent_assembly.b64 when present")
@@ -73,6 +74,13 @@ func main() {
 	pin, err := certPin(*cert)
 	if err != nil {
 		log.Fatalf("certificate pin failed: %v", err)
+	}
+	if *agentCertPinOverride != "" {
+		pin, err = normalizeCertPin(*agentCertPinOverride)
+		if err != nil {
+			log.Fatalf("invalid --agent-cert-pin-override: %v", err)
+		}
+		log.Printf("WARNING: using operator-supplied agent certificate pin override")
 	}
 	assembly, err := loadAssemblyB64(*agentAssemblyFile)
 	if err != nil {
@@ -707,6 +715,17 @@ type multiFlag []string
 
 func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+
+func normalizeCertPin(pin string) (string, error) {
+	normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(pin), ":", ""), " ", ""))
+	if len(normalized) != 64 {
+		return "", fmt.Errorf("pin must be 64 hex characters after removing colons/spaces")
+	}
+	if _, err := hex.DecodeString(normalized); err != nil {
+		return "", fmt.Errorf("pin must be hex: %w", err)
+	}
+	return normalized, nil
+}
 
 func certPin(path string) (string, error) {
 	pemBytes, err := os.ReadFile(path)
