@@ -14,38 +14,63 @@ namespace PSProxy.Agent
 {
     public sealed class Tunnel
     {
-        private const byte FrameOpen = 1, FrameOpenOK = 2, FrameOpenFail = 3, FrameData = 4, FrameClose = 5, FramePing = 6, FramePong = 7;
+        private const byte FrameOpen = 1, FrameOpenOK = 2, FrameOpenFail = 3, FrameData = 4, FrameClose = 5, FramePing = 6, FramePong = 7, FrameDNSQuery = 8, FrameDNSReply = 9;
         private const int MaxPayload = 1 << 20;
         private readonly string server;
         private readonly int port;
         private readonly string certPin;
         private readonly string enrollToken;
+        private readonly string reconnectToken;
+        private readonly string dnsTarget;
         private readonly ConcurrentDictionary<ulong, StreamCtx> streams = new ConcurrentDictionary<ulong, StreamCtx>();
         private readonly object sendLock = new object();
         private SslStream tls;
         private volatile bool stopping;
 
-        public Tunnel(string server, int port, string certPin, string enrollToken)
+        public Tunnel(string server, int port, string certPin, string enrollToken, string reconnectToken, string dnsTarget)
         {
             this.server = server;
             this.port = port;
             this.certPin = NormalizeHex(certPin);
             this.enrollToken = enrollToken;
+            this.reconnectToken = reconnectToken ?? "";
+            this.dnsTarget = dnsTarget ?? "";
             if (this.certPin.Length != 64) throw new ArgumentException("CertPin must be a SHA-256 hex string");
             if (String.IsNullOrWhiteSpace(enrollToken)) throw new ArgumentException("EnrollToken is required");
         }
 
         public void Run()
         {
+            int delayMs = 1000;
+            while (!stopping)
+            {
+                try
+                {
+                    RunOnce();
+                    delayMs = 1000;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("[ps-proxy] tunnel error: {0}", ex.Message);
+                    CloseAllStreams();
+                    if (stopping) break;
+                    Thread.Sleep(delayMs);
+                    delayMs = Math.Min(delayMs * 2, 30000);
+                }
+            }
+        }
+
+        private void RunOnce()
+        {
             Console.Error.WriteLine("[ps-proxy] connecting to {0}:{1}", server, port);
             using (var tcp = new TcpClient())
             {
                 tcp.NoDelay = true;
-                tcp.Connect(server, port);
+                ConnectWithTimeout(tcp, server, port, 15000);
                 using (tls = new SslStream(tcp.GetStream(), false, ValidateServerCertificate))
                 {
                     tls.AuthenticateAsClient(server, null, SslProtocols.Tls12, false);
-                    WriteAscii("PSP1\nENROLL " + enrollToken + "\n");
+                    WriteAscii("PSP1\nENROLL " + enrollToken + " " + reconnectToken + "\n");
                     Frame hello = ReadFrame();
                     if (hello.Type != FramePong || Encoding.ASCII.GetString(hello.Payload) != "OK") throw new Exception("server did not accept enrollment");
                     Console.Error.WriteLine("[ps-proxy] enrolled and ready");
@@ -65,6 +90,7 @@ namespace PSProxy.Agent
                     case FrameData: HandleData(f.StreamID, f.Payload); break;
                     case FrameClose: CloseStream(f.StreamID, false); break;
                     case FramePing: SendFrame(new Frame(f.StreamID, FramePong, new byte[0])); break;
+                    case FrameDNSQuery: StartDnsQuery(f.StreamID, f.Payload); break;
                 }
             }
         }
@@ -76,7 +102,7 @@ namespace PSProxy.Agent
                 string host; int dstPort; SplitTarget(target, out host, out dstPort);
                 var client = new TcpClient();
                 client.NoDelay = true;
-                client.Connect(host, dstPort);
+                ConnectWithTimeout(client, host, dstPort, 15000);
                 var ctx = new StreamCtx(sid, client);
                 if (!streams.TryAdd(sid, ctx)) { client.Close(); throw new Exception("duplicate stream"); }
                 SendFrame(new Frame(sid, FrameOpenOK, new byte[0]));
@@ -96,6 +122,36 @@ namespace PSProxy.Agent
             if (!streams.TryGetValue(sid, out ctx)) { SendFrame(new Frame(sid, FrameClose, new byte[0])); return; }
             try { ctx.Stream.Write(payload, 0, payload.Length); }
             catch { CloseStream(sid, true); }
+        }
+
+        private void StartDnsQuery(ulong sid, byte[] payload)
+        {
+            var t = new Thread(delegate() { HandleDnsQuery(sid, payload); });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void HandleDnsQuery(ulong sid, byte[] payload)
+        {
+            try
+            {
+                if (String.IsNullOrWhiteSpace(dnsTarget)) throw new Exception("DNS target is not configured");
+                string host; int dstPort; SplitTarget(dnsTarget, out host, out dstPort);
+                using (var udp = new UdpClient())
+                {
+                    udp.Client.ReceiveTimeout = 5000;
+                    udp.Connect(host, dstPort);
+                    udp.Send(payload, payload.Length);
+                    IPEndPoint ep = null;
+                    byte[] resp = udp.Receive(ref ep);
+                    SendFrame(new Frame(sid, FrameDNSReply, resp));
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[ps-proxy] DNS query failed: " + ex.Message);
+                SendFrame(new Frame(sid, FrameDNSReply, new byte[0]));
+            }
         }
 
         private void PumpTargetToServer(StreamCtx ctx)
@@ -124,6 +180,11 @@ namespace PSProxy.Agent
                 try { ctx.Client.Close(); } catch { }
                 if (notify) { try { SendFrame(new Frame(sid, FrameClose, new byte[0])); } catch { } }
             }
+        }
+
+        private void CloseAllStreams()
+        {
+            foreach (ulong sid in streams.Keys) CloseStream(sid, false);
         }
 
         private void SendFrame(Frame f)
@@ -190,6 +251,17 @@ namespace PSProxy.Agent
             host = target.Substring(0, idx);
             dstPort = Int32.Parse(target.Substring(idx + 1));
             if (dstPort < 1 || dstPort > 65535) throw new ArgumentException("invalid port");
+        }
+
+        private static void ConnectWithTimeout(TcpClient client, string host, int dstPort, int timeoutMs)
+        {
+            IAsyncResult ar = client.BeginConnect(host, dstPort, null, null);
+            if (!ar.AsyncWaitHandle.WaitOne(timeoutMs))
+            {
+                try { client.Close(); } catch { }
+                throw new TimeoutException("connect timed out: " + host + ":" + dstPort);
+            }
+            client.EndConnect(ar);
         }
 
         private static string NormalizeHex(string s) { return (s ?? "").Trim().ToLowerInvariant().Replace(":", "").Replace(" ", ""); }
