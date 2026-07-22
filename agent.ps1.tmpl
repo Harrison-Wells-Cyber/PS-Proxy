@@ -1,0 +1,38 @@
+# PS-Proxy agent loader. Single-file, diskless managed assembly loader for Windows PowerShell 5.1.
+param(
+    [string]$Server = "{{.Server}}",
+    [int]$Port = {{.Port}},
+    [string]$CertPin = "{{.CertPin}}",
+    [string]$EnrollToken = "{{.EnrollToken}}",
+    [switch]$NoAutoStart
+)
+$ErrorActionPreference = "Stop"
+function Import-PSProxyAgentAssembly {
+    $b64 = @'
+{{.AssemblyB64}}
+'@
+    if ([string]::IsNullOrWhiteSpace($b64) -or $b64.Trim().StartsWith("__")) {
+        throw "This agent.ps1 has not been packaged with PSProxy.Agent.dll. Build release/agent.ps1 on Windows with tools/build-agent.ps1."
+    }
+    $compressed = [Convert]::FromBase64String($b64.Trim())
+    $inputMs = New-Object IO.MemoryStream(,$compressed)
+    $gzip = New-Object IO.Compression.GzipStream($inputMs, [IO.Compression.CompressionMode]::Decompress)
+    $out = New-Object IO.MemoryStream
+    $buf = New-Object byte[] 8192
+    while (($n = $gzip.Read($buf, 0, $buf.Length)) -gt 0) { $out.Write($buf, 0, $n) }
+    $gzip.Dispose(); $inputMs.Dispose()
+    [void][System.Reflection.Assembly]::Load($out.ToArray())
+}
+function Start-PSTunnel {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$Server,
+        [int]$Port = 443,
+        [Parameter(Mandatory=$true)][string]$CertPin,
+        [Parameter(Mandatory=$true)][string]$EnrollToken
+    )
+    if (-not ("PSProxy.Agent.Tunnel" -as [type])) { Import-PSProxyAgentAssembly }
+    $t = New-Object PSProxy.Agent.Tunnel -ArgumentList @($Server, $Port, $CertPin, $EnrollToken)
+    $t.Run()
+}
+if (-not $NoAutoStart) { Start-PSTunnel -Server $Server -Port $Port -CertPin $CertPin -EnrollToken $EnrollToken }
