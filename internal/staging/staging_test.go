@@ -1,7 +1,9 @@
 package staging
 
 import (
+	"net/http/httptest"
 	"testing"
+	"text/template"
 	"time"
 )
 
@@ -45,5 +47,21 @@ func TestReconnectTokenSurvivesEnrollmentURLTTL(t *testing.T) {
 	time.Sleep(75 * time.Millisecond)
 	if err := store.Authenticate("", sess.ReconnectToken); err != nil {
 		t.Fatalf("reconnect token should survive URL TTL after enrollment: %v", err)
+	}
+}
+
+func TestAgentHandlerDoesNotHTMLEscapeAssemblyBase64(t *testing.T) {
+	store := NewStore(time.Minute)
+	sess, err := store.Create("c2.example.com", 443, "pin", "")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	tmpl := template.Must(template.New("agent").Parse("{{.AssemblyB64}}"))
+	r := httptest.NewRequest("GET", "/a/"+sess.ID, nil)
+	r.SetPathValue("id", sess.ID)
+	w := httptest.NewRecorder()
+	AgentHandler(store, tmpl, "AA+/=").ServeHTTP(w, r)
+	if got := w.Body.String(); got != "AA+/=" {
+		t.Fatalf("assembly base64 was escaped or changed: %q", got)
 	}
 }

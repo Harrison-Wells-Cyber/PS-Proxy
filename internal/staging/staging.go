@@ -4,9 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"html/template"
 	"net/http"
 	"sync"
+	"text/template"
 	"time"
 )
 
