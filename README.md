@@ -96,7 +96,10 @@ sudo ./psproxy-server \
   --cert /etc/letsencrypt/live/c2.example.com/fullchain.pem \
   --key /etc/letsencrypt/live/c2.example.com/privkey.pem \
   --route 10.10.10.0/24 \
-  --redirect
+  --redirect \
+  --max-streams 256 \
+  --dns-listen 127.0.0.1:5353 \
+  --dns-target 10.10.10.10:53
 ```
 
 With `--redirect`, PS-Proxy creates an iptables NAT chain for each `--route` and
@@ -140,7 +143,8 @@ ldapsearch -x -H ldap://127.0.0.1:1389 -D 'user@example.local' -W -b 'DC=example
 
 Transparent redirect mode is the recommended test-environment workflow right now.
 The fixed-target relay remains useful when you want a single local port mapped to
-a single target for debugging.
+a single target for debugging. Use `--max-streams` to cap concurrent proxied TCP
+connections during high-concurrency tools such as NetExec; the default is 256. When `--dns-listen` and `--dns-target` are set together, the server exposes a UDP DNS listener and forwards raw DNS queries through the enrolled agent to the internal DNS server reachable from the agent host.
 
 ## Security notes
 
@@ -163,10 +167,14 @@ Implemented now:
 - Go TLS listener with mixed HTTP staging and raw agent tunnel handling.
 - Leaf certificate pin calculation for generated agent configuration.
 - Short-lived one-time staging URLs.
-- One-time enrollment token validation for the raw tunnel.
+- One-time enrollment token validation for the raw tunnel plus reconnect-token authentication after first enrollment.
+- Agent auto-reconnect with exponential backoff for transient tunnel failures.
 - Framed multiplexed stream protocol.
 - Linux transparent TCP redirect mode for direct local-tool TCP connections to routed target IPs.
 - Fixed-target TCP relay mode for protocol validation.
+- Bounded concurrent stream handling with per-stream local write queues so one slow local TCP client cannot block the whole multiplexed agent session.
+- Optional UDP DNS relay that forwards raw DNS queries through the agent to an internal DNS server.
+- JSON `/status` endpoint for agent and stream visibility.
 - C# agent stream relay that opens normal outbound `TcpClient` connections from
   the Windows host.
 - PowerShell loader template that loads a compressed/base64 managed assembly from
@@ -190,5 +198,6 @@ matrix that includes:
 - NetExec SMB/LDAP tests;
 - Impacket SMB/LDAP/RPC tests;
 - reconnect and stale route cleanup tests;
+- DNS relay tests against an internal AD DNS server;
 - malformed frame and enrollment fuzz tests;
 - certificate pin mismatch tests.
