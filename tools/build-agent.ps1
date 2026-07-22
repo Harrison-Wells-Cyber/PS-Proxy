@@ -15,6 +15,8 @@ $ms = New-Object IO.MemoryStream
 $gz = New-Object IO.Compression.GzipStream($ms, [IO.Compression.CompressionMode]::Compress)
 $gz.Write($raw,0,$raw.Length); $gz.Dispose()
 $b64 = [Convert]::ToBase64String($ms.ToArray())
+$b64Out = Join-Path $RepoRoot "release/agent_assembly.b64"
+[IO.File]::WriteAllText($b64Out, $b64, [Text.Encoding]::ASCII)
 $template = Get-Content (Join-Path $RepoRoot "agent/loader/agent.ps1.tmpl") -Raw
 $template = $template.Replace('{{.AssemblyB64}}', $b64)
 $template = $template.Replace('{{.Server}}', '__SERVER__')
@@ -23,3 +25,4 @@ $template = $template.Replace('{{.CertPin}}', '__CERT_PIN__')
 $template = $template.Replace('{{.EnrollToken}}', '__ENROLL_TOKEN__')
 [IO.File]::WriteAllText($OutFile, $template, [Text.Encoding]::UTF8)
 Write-Host "Wrote $OutFile"
+Write-Host "Wrote $b64Out"
