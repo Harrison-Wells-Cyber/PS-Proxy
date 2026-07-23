@@ -276,24 +276,26 @@ namespace PSProxy.Agent
         {
             if (f.Payload == null) f.Payload = new byte[0];
             if (f.Payload.Length > MaxPayload) throw new InvalidOperationException("frame payload too large");
-            byte[] plainFrame = EncodePlainFrame(f);
-            byte[] seq = U64BE(sendSeq);
-            byte[] plain = Concat(seq, plainFrame);
-            byte[] padded = Pkcs7Pad(plain, 16);
-            byte[] iv = RandomBytes(16);
-            byte[] ct;
-            using (var aes = Aes.Create())
-            {
-                aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.None; aes.Key = encKey; aes.IV = iv;
-                using (var enc = aes.CreateEncryptor()) { ct = enc.TransformFinalBlock(padded, 0, padded.Length); }
-            }
-            byte[] body = Concat(iv, ct);
-            byte[] tag;
-            using (var h = new HMACSHA256(macKey)) { tag = h.ComputeHash(Concat(seq, body)); }
-            byte[] rec = Concat(body, tag);
-            byte[] len = new byte[4]; WriteI32BE(len, 0, rec.Length);
             lock (sendLock)
             {
+                // The sequence number is part of both plaintext and HMAC input, so
+                // frame construction must be serialized with the write/increment.
+                byte[] plainFrame = EncodePlainFrame(f);
+                byte[] seq = U64BE(sendSeq);
+                byte[] plain = Concat(seq, plainFrame);
+                byte[] padded = Pkcs7Pad(plain, 16);
+                byte[] iv = RandomBytes(16);
+                byte[] ct;
+                using (var aes = Aes.Create())
+                {
+                    aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.None; aes.Key = encKey; aes.IV = iv;
+                    using (var enc = aes.CreateEncryptor()) { ct = enc.TransformFinalBlock(padded, 0, padded.Length); }
+                }
+                byte[] body = Concat(iv, ct);
+                byte[] tag;
+                using (var h = new HMACSHA256(macKey)) { tag = h.ComputeHash(Concat(seq, body)); }
+                byte[] rec = Concat(body, tag);
+                byte[] len = new byte[4]; WriteI32BE(len, 0, rec.Length);
                 tls.Write(len, 0, len.Length); tls.Write(rec, 0, rec.Length); tls.Flush();
                 sendSeq++;
             }
