@@ -95,6 +95,9 @@ namespace PSProxy.Agent
             using (var rsa = new RSACryptoServiceProvider())
             {
                 rsa.ImportParameters(ParseRsaPublicKey(pubDer));
+                // .NET Framework RSACryptoServiceProvider supports OAEP only as
+                // SHA-1 with the default empty OAEP label. The server accepts
+                // this format for PowerShell 5.1 agent compatibility.
                 encSecret = rsa.Encrypt(secret, true);
             }
             string hello = "HELLO " + B64Url(encSecret) + " " + B64Url(nonce) + "\n";
@@ -196,6 +199,7 @@ namespace PSProxy.Agent
                     udp.Send(payload, payload.Length);
                     IPEndPoint ep = null;
                     byte[] resp = udp.Receive(ref ep);
+                    if (IsDnsTruncated(resp)) resp = QueryDnsOverTcp(host, dstPort, payload);
                     SendFrame(new Frame(sid, FrameDNSReply, resp));
                 }
             }
@@ -203,6 +207,35 @@ namespace PSProxy.Agent
             {
                 Console.Error.WriteLine("[ps-proxy] DNS query failed: " + ex.Message);
                 SendFrame(new Frame(sid, FrameDNSReply, new byte[0]));
+            }
+        }
+
+        private static bool IsDnsTruncated(byte[] resp)
+        {
+            return resp != null && resp.Length >= 4 && (resp[2] & 0x02) != 0;
+        }
+
+        private static byte[] QueryDnsOverTcp(string host, int dstPort, byte[] payload)
+        {
+            using (var tcp = new TcpClient())
+            {
+                tcp.NoDelay = true;
+                ConnectWithTimeout(tcp, host, dstPort, 5000);
+                tcp.ReceiveTimeout = 5000;
+                tcp.SendTimeout = 5000;
+                using (NetworkStream stream = tcp.GetStream())
+                {
+                    byte[] len = new byte[2];
+                    WriteU16BE(len, 0, payload.Length);
+                    stream.Write(len, 0, len.Length);
+                    stream.Write(payload, 0, payload.Length);
+                    stream.Flush();
+
+                    byte[] respLen = ReadExact(stream, 2);
+                    int n = ReadU16BE(respLen, 0);
+                    if (n == 0) throw new IOException("empty DNS TCP response");
+                    return ReadExact(stream, n);
+                }
             }
         }
 
@@ -306,11 +339,16 @@ namespace PSProxy.Agent
 
         private byte[] ReadExact(int n)
         {
+            return ReadExact(tls, n);
+        }
+
+        private static byte[] ReadExact(Stream stream, int n)
+        {
             byte[] b = new byte[n];
             int off = 0;
             while (off < n)
             {
-                int got = tls.Read(b, off, n - off);
+                int got = stream.Read(b, off, n - off);
                 if (got <= 0) throw new EndOfStreamException();
                 off += got;
             }
@@ -381,6 +419,8 @@ namespace PSProxy.Agent
         private static int ReadLen(byte[] b, ref int o) { if (o >= b.Length) throw new CryptographicException("asn1 len"); int v = b[o++]; if ((v & 0x80) == 0) return v; int n = v & 0x7f; if (n < 1 || n > 4 || o + n > b.Length) throw new CryptographicException("asn1 len"); int len = 0; for (int i = 0; i < n; i++) len = (len << 8) | b[o++]; return len; }
         private static void WriteI32BE(byte[] b, int o, int v) { b[o] = (byte)(v >> 24); b[o + 1] = (byte)(v >> 16); b[o + 2] = (byte)(v >> 8); b[o + 3] = (byte)v; }
         private static int ReadI32BE(byte[] b, int o) { return ((int)b[o] << 24) | ((int)b[o + 1] << 16) | ((int)b[o + 2] << 8) | (int)b[o + 3]; }
+        private static void WriteU16BE(byte[] b, int o, int v) { b[o] = (byte)(v >> 8); b[o + 1] = (byte)v; }
+        private static int ReadU16BE(byte[] b, int o) { return ((int)b[o] << 8) | (int)b[o + 1]; }
         private static void WriteU64BE(byte[] b, int o, ulong v) { for (int i = 7; i >= 0; i--) { b[o + i] = (byte)v; v >>= 8; } }
         private static ulong ReadU64BE(byte[] b, int o) { ulong v = 0; for (int i = 0; i < 8; i++) v = (v << 8) | b[o + i]; return v; }
     }
