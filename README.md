@@ -111,6 +111,13 @@ the original destination with `SO_ORIGINAL_DST`, sends that host:port through th
 encrypted tunnel, and the Windows agent opens the target with a normal outbound
 `TcpClient` from its network position.
 
+The server owns its configured `--listen`/`--port` socket while it is running.
+By default that is `0.0.0.0:443`, so another web server or reverse proxy cannot
+bind port 443 on the same IP at the same time. If you need another service on
+443, either bind PS-Proxy to a different address with `--listen`, run PS-Proxy on
+a different external port with `--port`, or put a fronting load balancer/reverse
+proxy on 443 and forward PS-Proxy traffic to its own backend port.
+
 The server prints a one-time command:
 
 ```powershell
@@ -148,7 +155,11 @@ ldapsearch -x -H ldap://127.0.0.1:1389 -D 'user@example.local' -W -b 'DC=example
 Transparent redirect mode is the recommended test-environment workflow right now.
 The fixed-target relay remains useful when you want a single local port mapped to
 a single target for debugging. Use `--max-streams` to cap concurrent proxied TCP
-connections during high-concurrency tools such as NetExec; the default is 256. When `--dns-listen` and `--dns-target` are set together, the server exposes a UDP DNS listener and forwards raw DNS queries through the enrolled agent to the internal DNS server reachable from the agent host.
+connections during high-concurrency tools such as NetExec; the default is 256.
+When `--dns-listen` and `--dns-target` are set together, the server exposes UDP
+and TCP DNS listeners on the same local address and forwards raw DNS queries
+through the enrolled agent to the internal DNS server reachable from the agent
+host.
 
 ## Security notes
 

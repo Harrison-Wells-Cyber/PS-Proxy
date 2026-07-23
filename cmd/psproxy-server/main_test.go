@@ -5,9 +5,12 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -84,6 +87,55 @@ func TestTunnelServerQueryDNS(t *testing.T) {
 	}
 }
 
+func TestServeDNSTCPForwardsLengthPrefixedQuery(t *testing.T) {
+	server := NewTunnelServer(staging.NewStore(time.Minute), 2)
+	agent, peer := net.Pipe()
+	defer peer.Close()
+	sess := NewAgentSession(agent, bufio.NewReader(agent), server.maxStreams)
+	defer sess.Close()
+	server.SetSession(sess)
+	go sess.Run()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go serveDNSTCP(ln, server)
+
+	go func() {
+		f, err := protocol.ReadFrame(peer)
+		if err != nil {
+			return
+		}
+		if string(f.Payload) != "dns-query" {
+			return
+		}
+		_ = protocol.WriteFrame(peer, protocol.Frame{StreamID: f.StreamID, Type: protocol.FrameDNSReply, Payload: []byte("dns-response")})
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var lenb [2]byte
+	binary.BigEndian.PutUint16(lenb[:], uint16(len("dns-query")))
+	if _, err := conn.Write(append(lenb[:], []byte("dns-query")...)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(conn, lenb[:]); err != nil {
+		t.Fatal(err)
+	}
+	resp := make([]byte, binary.BigEndian.Uint16(lenb[:]))
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatal(err)
+	}
+	if string(resp) != "dns-response" {
+		t.Fatalf("unexpected dns tcp response: %q", resp)
+	}
+}
+
 func TestValidateRoutes(t *testing.T) {
 	if err := validateRoutes([]string{"10.0.0.0/24", "192.168.1.10/32"}); err != nil {
 		t.Fatalf("valid routes rejected: %v", err)
@@ -131,6 +183,25 @@ func TestSingleListenerAcceptReturnsEOFAfterFirstConn(t *testing.T) {
 		t.Fatal("second accept should return EOF")
 	}
 }
+func TestDecryptSessionSecretAcceptsAgentSHA1OAEP(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 3072)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	enc, err := rsa.EncryptOAEP(sha1.New(), rand.Reader, &key.PublicKey, secret, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decryptSessionSecret(key, enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(secret) {
+		t.Fatalf("got %q want %q", got, secret)
+	}
+}
+
 func TestServerSecureHandshakeEncryptedFrame(t *testing.T) {
 	key, err := rsa.GenerateKey(rand.Reader, 3072)
 	if err != nil {
