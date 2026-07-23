@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -447,8 +448,18 @@ func serveDNSRelay(listenAddr string, server *TunnelServer) {
 	if err != nil {
 		log.Fatalf("dns relay listen failed: %v", err)
 	}
-	log.Printf("dns relay listening on udp://%s", listenAddr)
-	buf := make([]byte, 4096)
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		_ = conn.Close()
+		log.Fatalf("dns tcp relay listen failed: %v", err)
+	}
+	log.Printf("dns relay listening on udp://%s and tcp://%s", listenAddr, listenAddr)
+	go serveDNSTCP(ln, server)
+	serveDNSUDP(conn, server)
+}
+
+func serveDNSUDP(conn *net.UDPConn, server *TunnelServer) {
+	buf := make([]byte, 65535)
 	for {
 		n, client, err := conn.ReadFromUDP(buf)
 		if err != nil {
@@ -464,6 +475,53 @@ func serveDNSRelay(listenAddr string, server *TunnelServer) {
 			}
 			_, _ = conn.WriteToUDP(resp, client)
 		}()
+	}
+}
+
+func serveDNSTCP(ln net.Listener, server *TunnelServer) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("dns tcp relay accept failed: %v", err)
+			return
+		}
+		go handleDNSTCPConn(conn, server)
+	}
+}
+
+func handleDNSTCPConn(conn net.Conn, server *TunnelServer) {
+	defer conn.Close()
+	for {
+		var lenb [2]byte
+		if _, err := io.ReadFull(conn, lenb[:]); err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				log.Printf("dns tcp relay read length failed: %v", err)
+			}
+			return
+		}
+		n := int(binary.BigEndian.Uint16(lenb[:]))
+		if n == 0 {
+			return
+		}
+		query := make([]byte, n)
+		if _, err := io.ReadFull(conn, query); err != nil {
+			log.Printf("dns tcp relay read query failed: %v", err)
+			return
+		}
+		resp, err := server.QueryDNS(query)
+		if err != nil {
+			log.Printf("dns tcp relay query failed: %v", err)
+			return
+		}
+		if len(resp) > 65535 {
+			log.Printf("dns tcp relay response too large: %d", len(resp))
+			return
+		}
+		binary.BigEndian.PutUint16(lenb[:], uint16(len(resp)))
+		if _, err := conn.Write(append(lenb[:], resp...)); err != nil {
+			log.Printf("dns tcp relay write failed: %v", err)
+			return
+		}
 	}
 }
 
