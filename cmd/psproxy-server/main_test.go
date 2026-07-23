@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -131,6 +132,25 @@ func TestSingleListenerAcceptReturnsEOFAfterFirstConn(t *testing.T) {
 		t.Fatal("second accept should return EOF")
 	}
 }
+func TestDecryptSessionSecretAcceptsAgentSHA1OAEP(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 3072)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	enc, err := rsa.EncryptOAEP(sha1.New(), rand.Reader, &key.PublicKey, secret, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decryptSessionSecret(key, enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(secret) {
+		t.Fatalf("got %q want %q", got, secret)
+	}
+}
+
 func TestServerSecureHandshakeEncryptedFrame(t *testing.T) {
 	key, err := rsa.GenerateKey(rand.Reader, 3072)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -693,6 +694,25 @@ func handleAgent(conn net.Conn, br *bufio.Reader, server *TunnelServer) {
 	server.ClearSession(a)
 }
 
+func decryptSessionSecret(key *rsa.PrivateKey, encSecret []byte) ([]byte, error) {
+	label := []byte("PS-Proxy PSP1 session")
+	secret, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, key, encSecret, label)
+	if err == nil {
+		return secret, nil
+	}
+
+	// RSACryptoServiceProvider.Encrypt(..., true), used by the .NET Framework
+	// PowerShell agent, means OAEP-SHA1 with the default empty OAEP label. Keep
+	// accepting that wire format so already-staged agents can enroll.
+	for _, legacyLabel := range [][]byte{nil, label} {
+		legacySecret, legacyErr := rsa.DecryptOAEP(sha1.New(), rand.Reader, key, encSecret, legacyLabel)
+		if legacyErr == nil {
+			return legacySecret, nil
+		}
+	}
+	return nil, err
+}
+
 func serverHandshake(conn net.Conn, br *bufio.Reader, key *rsa.PrivateKey) (*protocol.SecureCodec, error) {
 	line, err := br.ReadString('\n')
 	if err != nil {
@@ -713,7 +733,7 @@ func serverHandshake(conn net.Conn, br *bufio.Reader, key *rsa.PrivateKey) (*pro
 	if len(clientNonce) != 32 {
 		return nil, errors.New("invalid client nonce")
 	}
-	secret, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, key, encSecret, []byte("PS-Proxy PSP1 session"))
+	secret, err := decryptSessionSecret(key, encSecret)
 	if err != nil {
 		return nil, err
 	}
