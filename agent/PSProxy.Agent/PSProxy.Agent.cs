@@ -95,6 +95,9 @@ namespace PSProxy.Agent
             using (var rsa = new RSACryptoServiceProvider())
             {
                 rsa.ImportParameters(ParseRsaPublicKey(pubDer));
+                // .NET Framework RSACryptoServiceProvider supports OAEP only as
+                // SHA-1 with the default empty OAEP label. The server accepts
+                // this format for PowerShell 5.1 agent compatibility.
                 encSecret = rsa.Encrypt(secret, true);
             }
             string hello = "HELLO " + B64Url(encSecret) + " " + B64Url(nonce) + "\n";
