@@ -3,7 +3,7 @@
 PS-Proxy is a route-based TCP pivot for operators who need to reach internal
 network services from a Linux VPS through a Windows host that can access those
 services. It is built for TCP-heavy tooling such as Impacket, NetExec,
-RustHound, `ldapsearch`, and TCP-connect `nmap` without proxychains and without
+and TCP-connect `nmap` without proxychains and without
 requiring local administrator privileges on the Windows agent host.
 
 The tool has two parts:
@@ -31,7 +31,7 @@ The tool has two parts:
    original destination and asks the agent to open that target from the Windows
    side.
 
-The Windows agent does not intentionally write the managed payload DLL to disk.
+The Windows agent does not intentionally write the managed payload DLL to disk, maintaining stealth.
 Release agents load the embedded assembly with
 `[System.Reflection.Assembly]::Load(byte[])`.
 
@@ -99,8 +99,7 @@ sudo ./psproxy-server \
 ```
 
 By default, PS-Proxy listens on `0.0.0.0:443`. If another service already uses
-port 443, set `--listen` or `--port`, or place PS-Proxy behind a fronting load
-balancer or reverse proxy that forwards to its own backend port.
+port 443, set `--listen` or `--port`
 
 ### Run the Windows agent
 
@@ -114,13 +113,15 @@ Run that command in Windows PowerShell 5.1 on the Windows host that can reach th
 internal network. After the agent enrolls, keep the PowerShell session running
 for as long as you need the tunnel.
 
+Alternatively, if you don't want to use the irm | iex workflow, the agent can be downloaded
+from the provided link and ran with . .\agent.ps1
+
 ### Use your tools
 
 From the Linux server, connect to hosts in the routed CIDR directly. For example:
 
 ```bash
-ldapsearch -x -H ldap://10.10.10.10 -b 'DC=example,DC=local' '(objectClass=domain)'
-nmap -sT -Pn -p 445 10.10.10.10
+nxc smb 10.10.10.219 -u user -p password -d pwned.local
 ```
 
 With `--redirect`, matching TCP connections to `--route` networks are redirected
@@ -136,12 +137,12 @@ sudo ./psproxy-server \
   --domain c2.example.com \
   --route 10.10.10.0/24 \
   --redirect \
-  --dns-listen 127.0.0.1:5353 \
+  --dns-listen 127.0.0.1:53 \
   --dns-target 10.10.10.10:53
 ```
 
-Then point DNS-capable tools at `127.0.0.1:5353` when they support a custom DNS
-server and port.
+Then point DNS-capable tools at `127.0.0.1:53` when they support a custom DNS
+server.
 
 ### Optional fixed-target TCP relay
 
@@ -173,7 +174,7 @@ ldapsearch -x -H ldap://127.0.0.1:1389 -b 'DC=example,DC=local' '(objectClass=do
 ## Build from source
 
 Use this path if you cloned the repository and want to produce the server binary
-and packaged agent assets yourself.
+and packaged agent assets yourself. (Or don't trust that the base64 blob is clean lol)
 
 ### Requirements
 
